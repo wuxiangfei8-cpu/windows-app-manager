@@ -1,0 +1,1747 @@
+﻿import ctypes
+import json
+import os
+import struct
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from PIL import Image, ImageDraw, ImageTk
+except ImportError:
+    Image = ImageDraw = ImageTk = None
+
+
+CONFIG_FILE = Path.home() / ".windows_manager.json"
+RESULT_CACHE_FILE = Path.home() / ".windows_manager_results.json"
+DEFAULT_BLOCKED_KEYWORDS = (
+    "unins", "update", "patch", "setup", "config", "helper", "crash",
+    "service", "cli", "sdk",
+)
+IMAGE_SUBSYSTEM_WINDOWS_GUI = 2
+IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
+CREATE_NO_WINDOW = 0x08000000
+SCAN_WORKERS = max(4, min(16, (os.cpu_count() or 4) * 2))
+SCAN_CACHE = {}
+SCAN_CACHE_LOCK = threading.Lock()
+ICON_CACHE = {}
+ICON_CACHE_LOCK = threading.Lock()
+THEMES = {
+    "android": {
+        "name": "Android 桌面",
+        "background": "#1f1f1f",
+        "card": "#2b2b2b",
+        "text": "#ffffff",
+        "muted": "#a0a0a0",
+        "accent": "#0078d4",
+        "card_hover": "#333333",
+        "button_hover": "#1084d7",
+        "shadow": "rgba(0,0,0,0.25)",
+        "border": "#3a3a3a",
+    },
+    "win11": {
+        "name": "Windows 11",
+        "background": "#ffffff",
+        "card": "#f5f5f5",
+        "text": "#000000",
+        "muted": "#757575",
+        "accent": "#0078d4",
+        "card_hover": "#e8e8e8",
+        "button_hover": "#005a9e",
+        "shadow": "rgba(0,0,0,0.08)",
+        "border": "#e0e0e0",
+        "surface": "#fafafa",
+    },
+    "simple white": {
+        "name": "Simple White",
+        "background": "#ffffff",
+        "card": "#f5f5f5",
+        "text": "#111111",
+        "muted": "#6b7280",
+        "accent": "#0078d4",
+        "card_hover": "#eef3ff",
+        "button_hover": "#0064c8",
+        "shadow": "rgba(0,0,0,0.06)",
+        "border": "#e5e7eb",
+        "surface": "#fafafa",
+    },
+}
+
+
+@dataclass(frozen=True)
+class ExecutableInfo:
+    file_description: str = ""
+    product_name: str = ""
+    company_name: str = ""
+    subsystem: int | None = None
+    has_icon: bool = False
+
+    @property
+    def display_name(self):
+        return self.product_name or self.file_description or ""
+
+    @property
+    def has_version_metadata(self):
+        return bool(self.file_description or self.product_name or self.company_name)
+
+    @property
+    def has_required_identity(self):
+        return bool(self.product_name or self.company_name)
+
+    @property
+    def subsystem_text(self):
+        return {IMAGE_SUBSYSTEM_WINDOWS_GUI: "GUI", IMAGE_SUBSYSTEM_WINDOWS_CUI: "CUI"}.get(
+            self.subsystem, "未知"
+        )
+
+    @property
+    def confidence_score(self):
+        score = 0
+        if self.has_version_metadata:
+            score += 40
+        if self.subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI:
+            score += 30
+        if self.has_icon:
+            score += 20
+        return score + 10
+
+
+@dataclass(frozen=True)
+class Application:
+    name: str
+    path: str
+    size: int
+    modified: float
+    metadata: ExecutableInfo = field(default_factory=ExecutableInfo)
+    filter_note: str = ""
+
+    @property
+    def modified_text(self):
+        return datetime.fromtimestamp(self.modified).strftime("%Y-%m-%d %H:%M")
+
+    @property
+    def size_text(self):
+        size = float(self.size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+
+
+def load_config():
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(folders, excludes, filters=None, theme=None, app_folders=None,
+                desktop_order=None, dock_paths=None, desktop_settings=None,
+                hidden_paths=None, badges=None):
+    data = {"folders": folders, "excludes": excludes, "filters": filters or {}}
+    if theme is not None:
+        data["theme"] = theme
+    if app_folders is not None:
+        data["app_folders"] = {name: sorted(paths) for name, paths in app_folders.items()}
+    if desktop_order is not None:
+        data["desktop_order"] = list(desktop_order)
+    if dock_paths is not None:
+        data["dock_paths"] = list(dock_paths)
+    if desktop_settings is not None:
+        data["desktop_settings"] = desktop_settings
+    if hidden_paths is not None:
+        data["hidden_paths"] = sorted(hidden_paths)
+    if badges is not None:
+        data["badges"] = dict(badges)
+    try:
+        CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _scan_context(folders, excludes, filters):
+    return {
+        "folders": sorted(os.path.normcase(os.path.abspath(path)) for path in folders),
+        "excludes": sorted(os.path.normcase(os.path.abspath(path)) for path in excludes),
+        "filters": filters,
+    }
+
+
+def _application_to_dict(app):
+    return {
+        "name": app.name,
+        "path": app.path,
+        "size": app.size,
+        "modified": app.modified,
+        "filter_note": app.filter_note,
+        "metadata": {
+            "file_description": app.metadata.file_description,
+            "product_name": app.metadata.product_name,
+            "company_name": app.metadata.company_name,
+            "subsystem": app.metadata.subsystem,
+            "has_icon": app.metadata.has_icon,
+        },
+    }
+
+
+def _application_from_dict(data):
+    metadata = data.get("metadata", {})
+    return Application(
+        name=str(data["name"]), path=str(data["path"]), size=int(data["size"]),
+        modified=float(data["modified"]), filter_note=str(data.get("filter_note", "")),
+        metadata=ExecutableInfo(
+            file_description=str(metadata.get("file_description", "")),
+            product_name=str(metadata.get("product_name", "")),
+            company_name=str(metadata.get("company_name", "")),
+            subsystem=metadata.get("subsystem"),
+            has_icon=bool(metadata.get("has_icon", False)),
+        ),
+    )
+
+
+def save_scan_cache(folders, excludes, filters, apps):
+    payload = {"context": _scan_context(folders, excludes, filters),
+               "applications": [_application_to_dict(app) for app in apps]}
+    try:
+        RESULT_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_scan_cache(folders, excludes, filters):
+    try:
+        payload = json.loads(RESULT_CACHE_FILE.read_text(encoding="utf-8"))
+        if payload.get("context") != _scan_context(folders, excludes, filters):
+            return []
+        apps = []
+        for item in payload.get("applications", []):
+            app = _application_from_dict(item)
+            try:
+                stat = os.stat(app.path)
+                if stat.st_size == app.size and stat.st_mtime == app.modified:
+                    apps.append(app)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        return apps
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return []
+
+
+def create_rounded_rectangle(width, height, radius, color, shadow_color=None, border_color=None):
+    """创建圆角矩形图像，支持阴影和边框"""
+    if Image is None:
+        return None
+    try:
+        if shadow_color:
+            shadow_width = 3
+            img = Image.new("RGBA", (width + shadow_width * 2, height + shadow_width * 2), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            shadow_rgba = shadow_color + (40,) if len(shadow_color) == 3 else shadow_color
+            draw.rounded_rectangle(
+                [(shadow_width, shadow_width), (width + shadow_width - 1, height + shadow_width - 1)],
+                radius=radius, fill=shadow_rgba
+            )
+            img_blur = img.filter(Image.BLUR) if hasattr(Image, 'BLUR') else img
+            result = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            result.paste(img_blur, (0, 0), img_blur)
+        else:
+            result = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+        draw = ImageDraw.Draw(result)
+        color_rgba = color + (255,) if len(color) == 3 else color
+        draw.rounded_rectangle([(0, 0), (width - 1, height - 1)], radius=radius, fill=color_rgba)
+
+        if border_color:
+            border_rgba = border_color + (100,) if len(border_color) == 3 else border_color
+            draw.rounded_rectangle([(0, 0), (width - 1, height - 1)], radius=radius, outline=border_rgba, width=1)
+
+        return result
+    except Exception:
+        return None
+
+
+def hex_to_rgb(hex_color):
+    """将十六进制颜色转换为RGB元组"""
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def create_button_background(width, height, color, is_hover=False, is_pressed=False):
+    """创建按钮背景图像，支持hover和pressed状态"""
+    if Image is None:
+        return None
+    try:
+        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        rgb = hex_to_rgb(color) if isinstance(color, str) else color
+        if is_pressed:
+            rgb = tuple(int(c * 0.7) for c in rgb)
+        elif is_hover:
+            rgb = tuple(min(255, int(c * 1.2)) for c in rgb)
+
+        color_rgba = rgb + (255,)
+        draw.rounded_rectangle([(0, 0), (width - 1, height - 1)], radius=4, fill=color_rgba)
+        return img
+    except Exception:
+        return None
+
+
+def create_card_background(width, height, color, border_color=None, shadow=False):
+    """创建卡片背景图像，支持边框和阴影"""
+    if Image is None:
+        return None
+    try:
+        if shadow:
+            shadow_width = 2
+            img = Image.new("RGBA", (width + shadow_width * 2, height + shadow_width * 2), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            shadow_rgb = (0, 0, 0)
+            draw.rounded_rectangle(
+                [(shadow_width, shadow_width), (width + shadow_width - 1, height + shadow_width - 1)],
+                radius=8, fill=shadow_rgb + (25,)
+            )
+            result = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            result.paste(img, (-shadow_width, -shadow_width), img)
+        else:
+            result = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+        draw = ImageDraw.Draw(result)
+        rgb = hex_to_rgb(color) if isinstance(color, str) else color
+        color_rgba = rgb + (255,)
+        draw.rounded_rectangle([(0, 0), (width - 1, height - 1)], radius=8, fill=color_rgba)
+
+        if border_color:
+            border_rgb = hex_to_rgb(border_color) if isinstance(border_color, str) else border_color
+            draw.rounded_rectangle([(0, 0), (width - 1, height - 1)], radius=8, outline=border_rgb + (80,), width=1)
+
+        return result
+    except Exception:
+        return None
+
+
+def lighten_color(hex_color, amount=0.1):
+    """淡化颜色"""
+    rgb = hex_to_rgb(hex_color)
+    rgb = tuple(min(255, int(c + (255 - c) * amount)) for c in rgb)
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def darken_color(hex_color, amount=0.1):
+    """深化颜色"""
+    rgb = hex_to_rgb(hex_color)
+    rgb = tuple(max(0, int(c * (1 - amount))) for c in rgb)
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def style_listbox(listbox, theme):
+    """为Listbox应用主题样式"""
+    if not isinstance(theme, dict):
+        return
+    listbox.configure(
+        bg=theme.get("card", "#2b2b2b"),
+        fg=theme.get("text", "#ffffff"),
+        selectbackground=theme.get("accent", "#0078d4"),
+        selectforeground=theme.get("text", "#ffffff"),
+        borderwidth=1,
+        relief="solid",
+        activestyle="none",
+        highlightthickness=0
+    )
+
+
+def style_text_widget(text_widget, theme):
+    """为Text组件应用主题样式"""
+    if not isinstance(theme, dict):
+        return
+    text_widget.configure(
+        bg=theme.get("card", "#2b2b2b"),
+        fg=theme.get("text", "#ffffff"),
+        insertbackground=theme.get("accent", "#0078d4"),
+        selectbackground=theme.get("accent", "#0078d4"),
+        selectforeground=theme.get("text", "#ffffff"),
+        borderwidth=1,
+        relief="solid"
+    )
+
+
+def _read_version_resource(path):
+    result = {"FileDescription": "", "ProductName": "", "CompanyName": ""}
+    if os.name != "nt":
+        return result
+    try:
+        version = ctypes.windll.version
+        version.GetFileVersionInfoSizeW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint)]
+        version.GetFileVersionInfoSizeW.restype = ctypes.c_uint
+        size = version.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return result
+        buffer = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(path, 0, size, buffer):
+            return result
+        value = ctypes.c_void_p()
+        length = ctypes.c_uint()
+        query = ctypes.c_wchar_p("\\VarFileInfo\\Translation")
+        if not version.VerQueryValueW(buffer, query, ctypes.byref(value), ctypes.byref(length)) or not length.value:
+            return result
+        language, codepage = struct.unpack_from("<HH", ctypes.string_at(value, 4))
+        for key in result:
+            query = f"\\StringFileInfo\\{language:04x}{codepage:04x}\\{key}"
+            value = ctypes.c_void_p()
+            length = ctypes.c_uint()
+            if version.VerQueryValueW(buffer, query, ctypes.byref(value), ctypes.byref(length)) and value.value:
+                result[key] = ctypes.wstring_at(value.value).strip()
+    except (AttributeError, OSError, ValueError, struct.error):
+        pass
+    return result
+
+
+def _read_pe_subsystem(path):
+    try:
+        with open(path, "rb") as stream:
+            header = stream.read(4096)
+        if len(header) < 0x40 or header[:2] != b"MZ":
+            return None
+        pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+        if pe_offset + 26 > len(header) or header[pe_offset:pe_offset + 4] != b"PE\0\0":
+            return None
+        optional_offset = pe_offset + 24
+        magic = struct.unpack_from("<H", header, optional_offset)[0]
+        if magic not in (0x10B, 0x20B) or optional_offset + 70 > len(header):
+            return None
+        return struct.unpack_from("<H", header, optional_offset + 68)[0]
+    except (OSError, struct.error):
+        return None
+
+
+def _has_executable_icon(path):
+    if os.name != "nt":
+        return False
+    try:
+        class ShFileInfo(ctypes.Structure):
+            _fields_ = [("hIcon", ctypes.c_void_p), ("iIcon", ctypes.c_int),
+                        ("dwAttributes", ctypes.c_uint), ("szDisplayName", ctypes.c_wchar * 260),
+                        ("szTypeName", ctypes.c_wchar * 80)]
+        info = ShFileInfo()
+        flags = 0x000000100 | 0x000000001
+        result = ctypes.windll.shell32.SHGetFileInfoW(path, 0, ctypes.byref(info), ctypes.sizeof(info), flags)
+        if not result or not info.hIcon:
+            return False
+        ctypes.windll.user32.DestroyIcon(info.hIcon)
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def _extract_icon_image(path, size=96):
+    if os.name != "nt" or Image is None:
+        return None
+    try:
+        class IconInfo(ctypes.Structure):
+            _fields_ = [("fIcon", ctypes.c_int), ("xHotspot", ctypes.c_uint),
+                        ("yHotspot", ctypes.c_uint), ("hbmMask", ctypes.c_void_p),
+                        ("hbmColor", ctypes.c_void_p)]
+
+        class BitmapInfoHeader(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                        ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                        ("biClrImportant", ctypes.c_uint32)]
+
+        class BitmapInfo(ctypes.Structure):
+            _fields_ = [("bmiHeader", BitmapInfoHeader), ("bmiColors", ctypes.c_uint32 * 3)]
+
+        icons = (ctypes.c_void_p * 1)()
+        extract_icon = ctypes.windll.shell32.ExtractIconExW
+        extract_icon.argtypes = [ctypes.c_wchar_p, ctypes.c_int,
+                                 ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                 ctypes.c_uint]
+        extract_icon.restype = ctypes.c_uint
+        if not extract_icon(path, 0, icons, None, 1):
+            return None
+        hicon = icons[0]
+        if not hicon:
+            return None
+        icon_info = IconInfo()
+        if not ctypes.windll.user32.GetIconInfo(hicon, ctypes.byref(icon_info)):
+            ctypes.windll.user32.DestroyIcon(hicon)
+            return None
+        bitmap = BitmapInfo()
+        bitmap.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+        bitmap.bmiHeader.biWidth = size
+        bitmap.bmiHeader.biHeight = -size
+        bitmap.bmiHeader.biPlanes = 1
+        bitmap.bmiHeader.biBitCount = 32
+        pixels = ctypes.create_string_buffer(size * size * 4)
+        screen_dc = ctypes.windll.user32.GetDC(0)
+        memory_dc = ctypes.windll.gdi32.CreateCompatibleDC(screen_dc)
+        copied = ctypes.windll.gdi32.GetDIBits(memory_dc, icon_info.hbmColor, 0, size,
+                                               pixels, ctypes.byref(bitmap), 0)
+        ctypes.windll.gdi32.DeleteDC(memory_dc)
+        ctypes.windll.user32.ReleaseDC(0, screen_dc)
+        ctypes.windll.gdi32.DeleteObject(icon_info.hbmColor)
+        ctypes.windll.gdi32.DeleteObject(icon_info.hbmMask)
+        ctypes.windll.user32.DestroyIcon(hicon)
+        if not copied:
+            return None
+        return Image.frombuffer("RGBA", (size, size), pixels, "raw", "BGRA", 0, 1).copy()
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        return None
+
+
+def get_icon_image(app, size=96):
+    key = (os.path.normcase(app.path), app.size, app.modified, size)
+    with ICON_CACHE_LOCK:
+        if key in ICON_CACHE:
+            return ICON_CACHE[key]
+    image = _extract_icon_image(app.path, size)
+    with ICON_CACHE_LOCK:
+        ICON_CACHE[key] = image
+    return image
+
+
+def inspect_executable(path, size):
+    version = _read_version_resource(path)
+    return ExecutableInfo(
+        file_description=version["FileDescription"],
+        product_name=version["ProductName"],
+        company_name=version["CompanyName"],
+        subsystem=_read_pe_subsystem(path),
+        has_icon=_has_executable_icon(path),
+    )
+
+
+def _matches_list(path, entries):
+    normalized_path = os.path.normcase(os.path.abspath(path))
+    filename = os.path.basename(path).lower()
+    return any(item and (os.path.normcase(os.path.abspath(item)) == normalized_path
+                         or item.lower() in filename) for item in entries)
+
+
+def filter_executable(path, size, metadata, filters):
+    normalized_path = os.path.normcase(os.path.abspath(path)).lower()
+    denylist = [item.lower() for item in filters.get("denylist", []) if item]
+    blocked = tuple(dict.fromkeys(DEFAULT_BLOCKED_KEYWORDS + tuple(denylist)))
+    if any(keyword in normalized_path for keyword in blocked):
+        return False, "文件名特征"
+    if not metadata.has_icon:
+        return False, "无可提取图标"
+    if size < int(filters.get("min_size", 100 * 1024)):
+        return False, "体积过小"
+    if not metadata.has_required_identity:
+        return False, "缺少产品名或公司名"
+    if metadata.subsystem != IMAGE_SUBSYSTEM_WINDOWS_GUI:
+        return False, "非 GUI 程序"
+    return True, "GUI 应用"
+
+
+def _scan_one_executable(path, filters):
+    try:
+        stat = os.stat(path)
+        filter_key = json.dumps(filters, sort_keys=True, ensure_ascii=False)
+        cache_key = (os.path.normcase(path), stat.st_size, stat.st_mtime_ns, filter_key)
+        with SCAN_CACHE_LOCK:
+            if cache_key in SCAN_CACHE:
+                return SCAN_CACHE[cache_key]
+        metadata = inspect_executable(path, stat.st_size)
+        include, note = filter_executable(path, stat.st_size, metadata, filters)
+        if not include:
+            result = None
+        else:
+            result = Application(metadata.display_name or Path(path).stem, path, stat.st_size,
+                                 stat.st_mtime, metadata, note)
+        with SCAN_CACHE_LOCK:
+            SCAN_CACHE[cache_key] = result
+        return result
+    except Exception:
+        return None
+
+
+def scan_executables(folders, excludes, filters=None, on_item=None, on_progress=None):
+    filters = filters or {}
+    excluded = {os.path.normcase(os.path.abspath(path)) for path in excludes}
+    paths = {}
+    for folder in folders:
+        root = os.path.abspath(folder)
+        if not os.path.isdir(root):
+            continue
+        for current, directories, files in os.walk(root, topdown=True, onerror=lambda _: None):
+            current_normalized = os.path.normcase(os.path.abspath(current))
+            if any(current_normalized == item or current_normalized.startswith(item + os.sep)
+                   for item in excluded):
+                directories[:] = []
+                continue
+            directories[:] = [directory for directory in directories
+                              if os.path.normcase(os.path.join(current, directory)) not in excluded]
+            for filename in files:
+                if not filename.lower().endswith(".exe"):
+                    continue
+                path = os.path.abspath(os.path.join(current, filename))
+                key = os.path.normcase(path)
+                paths[key] = path
+
+    if on_progress:
+        on_progress(0, len(paths))
+    found = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix="exe-scan") as executor:
+        futures = [executor.submit(_scan_one_executable, path, filters) for path in paths.values()]
+        for completed, future in enumerate(as_completed(futures), 1):
+            app = future.result()
+            if app is not None:
+                found[os.path.normcase(app.path)] = app
+            if on_progress:
+                on_progress(completed, len(paths))
+    merged = {}
+    for app in found.values():
+        name_key = app.name.strip().casefold()
+        existing = merged.get(name_key)
+        if existing is None or (app.metadata.confidence_score, app.size) > \
+                (existing.metadata.confidence_score, existing.size):
+            merged[name_key] = app
+    results = list(merged.values())
+    if on_item:
+        for app in results:
+            on_item(app)
+    return results
+
+
+class ApplicationManager(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Windows 应用资源库")
+        self.geometry("1250x720")
+        self.resizable(True, True)
+        self.config_data = load_config()
+        self.folders = list(self.config_data.get("folders", []))
+        self.excludes = list(self.config_data.get("excludes", []))
+        saved_filters = self.config_data.get("filters", {})
+        self.filters = {
+            "gui_only": saved_filters.get("gui_only", True),
+            "require_version": saved_filters.get("require_version", True),
+            "min_size": self._read_min_size(saved_filters.get("min_size", 100 * 1024)),
+            "allowlist": list(saved_filters.get("allowlist", [])),
+            "denylist": list(saved_filters.get("denylist", [])),
+        }
+        self.apps = []
+        self.filtered_apps = []
+        self.app_by_iid = {}
+        self.card_widgets = {}
+        self.android_app_cards = []
+        self.selected_app_path = None
+        self.app_folders = {
+            str(name): set(paths)
+            for name, paths in self.config_data.get("app_folders", {}).items()
+            if isinstance(paths, list)
+        }
+        self.desktop_order = list(self.config_data.get("desktop_order", []))
+        self.dock_paths = list(self.config_data.get("dock_paths", []))
+        self.android_page = 0
+        self.android_page_size = 20
+        self.android_last_width = 0
+        self.drag_app_path = None
+        self.android_press_after = None
+        self.android_dragging = False
+        self.android_drag_path = None
+        self.android_drag_iid = None
+        self.android_drag_target = None
+        desktop_settings = self.config_data.get("desktop_settings", {})
+        if not isinstance(desktop_settings, dict):
+            desktop_settings = {}
+        self.desktop_columns = self._read_grid_value(desktop_settings.get("columns", 5), 4, 8, 5)
+        self.desktop_rows = self._read_grid_value(desktop_settings.get("rows", 4), 3, 8, 4)
+        self.layout_mode = desktop_settings.get("layout_mode", "grid")
+        if self.layout_mode not in ("grid", "free"):
+            self.layout_mode = "grid"
+        self.icon_shape = desktop_settings.get("icon_shape", "square")
+        if self.icon_shape not in ("square", "rounded", "circle"):
+            self.icon_shape = "square"
+        saved_positions = desktop_settings.get("positions", {})
+        self.desktop_positions = {
+            str(path): (int(position[0]), int(position[1]))
+            for path, position in (saved_positions.items()
+                                   if isinstance(saved_positions, dict) else [])
+            if isinstance(position, (list, tuple)) and len(position) == 2
+        }
+        self.android_drag_offset = (0, 0)
+        saved_hidden = self.config_data.get("hidden_paths", [])
+        self.hidden_paths = set(saved_hidden if isinstance(saved_hidden, list) else [])
+        saved_badges = self.config_data.get("badges", {})
+        self.badges = {str(path): str(value) for path, value in
+                       (saved_badges.items() if isinstance(saved_badges, dict) else [])}
+        self.theme_name = self.config_data.get("theme", "simple white")
+        if self.theme_name not in THEMES:
+            self.theme_name = "simple white"'
+        self.build_ui()
+        self.refresh_folder_list()
+        self.apps = load_scan_cache(self.folders, self.excludes, self.filters)
+        if self.apps:
+            self.status.config(text=f"已加载缓存：{len(self.apps)} 个应用（点击“扫描”刷新）")
+            self.render_apps()
+        else:
+            self.status.config(text="暂无缓存结果，请点击“扫描”开始")
+
+    @staticmethod
+    def _read_min_size(value):
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 100 * 1024
+
+    @staticmethod
+    def _read_grid_value(value, minimum, maximum, fallback):
+        try:
+            return max(minimum, min(maximum, int(value)))
+        except (TypeError, ValueError):
+            return fallback
+
+    def build_ui(self):
+        toolbar = ttk.Frame(self, padding=10)
+        toolbar.pack(fill=tk.X)
+        ttk.Label(toolbar, text="Windows 应用资源库", font=("Segoe UI", 18, "bold")).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="设置", command=self.open_settings).pack(side=tk.RIGHT, padx=(8, 0))
+        self.theme_label = ttk.Label(toolbar, text="")
+        self.theme_label.pack(side=tk.RIGHT)
+        self.search = tk.StringVar()
+        search_box = ttk.Entry(toolbar, textvariable=self.search, width=30)
+        search_box.pack(side=tk.RIGHT, padx=(8, 0))
+        search_box.bind("<KeyRelease>", lambda _: self.render_apps())
+        ttk.Label(toolbar, text="搜索：").pack(side=tk.RIGHT)
+
+        self.main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self.main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        left = ttk.LabelFrame(self.main_pane, text="扫描范围", padding=8)
+        self.scan_panel = left
+        self.main_pane.add(left, weight=0)
+        self.folder_list = tk.Listbox(left, width=38, height=18, selectmode=tk.EXTENDED)
+        self.folder_list.pack(fill=tk.BOTH, expand=True)
+        self.scan_button = ttk.Button(left, text="扫描", command=self.start_scan)
+        self.progress = ttk.Progressbar(left, mode="determinate", maximum=1, value=0)
+        self.progress.pack(fill=tk.X, pady=(10, 0))
+        self.status = ttk.Label(left, text="准备就绪", wraplength=240)
+        self.status.pack(fill=tk.X, pady=(10, 0))
+
+        right = ttk.Frame(self.main_pane)
+        self.main_pane.add(right, weight=1)
+        if self.theme_name == "android":
+            self.main_pane.forget(left)
+        header = ttk.Frame(right)
+        header.pack(fill=tk.X, pady=(0, 6))
+        self.count_label = ttk.Label(header, text="0 个应用")
+        self.count_label.pack(side=tk.LEFT)
+        self.sort_value = tk.StringVar(value="名称")
+        ttk.Label(header, text="排序：").pack(side=tk.RIGHT)
+        sort = ttk.Combobox(header, textvariable=self.sort_value, values=("名称", "大小", "修改时间"),
+                            state="readonly", width=10)
+        sort.pack(side=tk.RIGHT, padx=5)
+        sort.bind("<<ComboboxSelected>>", lambda _: self.render_apps())
+        self.card_canvas = tk.Canvas(right, highlightthickness=0, borderwidth=0)
+        card_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.card_canvas.yview)
+        self.card_canvas.configure(yscrollcommand=card_scroll.set)
+        card_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.card_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.card_frame = tk.Frame(self.card_canvas, borderwidth=0)
+        self.card_window = self.card_canvas.create_window((0, 0), window=self.card_frame, anchor="nw")
+        self.card_frame.bind("<Configure>", lambda _: self.card_canvas.configure(
+            scrollregion=self.card_canvas.bbox("all")))
+        self.card_canvas.bind("<Configure>", self._resize_card_frame)
+        bottom = ttk.Frame(right)
+        bottom.pack(fill=tk.X, pady=(6, 0))
+        self.android_page_label = ttk.Label(bottom, text="")
+        self.android_page_label.pack_forget()
+        self.android_prev_button = ttk.Button(bottom, text="‹", width=3,
+                                              command=lambda: self.change_android_page(-1))
+        self.android_prev_button.pack_forget()
+        self.android_next_button = ttk.Button(bottom, text="›", width=3,
+                                              command=lambda: self.change_android_page(1))
+        self.android_next_button.pack_forget()
+        self.dock_frame = tk.Frame(right, height=74)
+        self.dock_frame.pack_forget()
+        self.dock_frame.pack_propagate(False)
+        self.apply_theme() , "explanation":"Remove Android-only pagination UI from the default layout so the app uses a single merged tile view."},{
+
+    def apply_theme_config(self):
+        """应用主题样式配置"""
+        theme = THEMES.get(self.theme_name, THEMES["android"])
+        style = ttk.Style(self)
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+
+        bg = theme["background"]
+        fg = theme["text"]
+        card_bg = theme["card"]
+        accent = theme["accent"]
+        muted = theme["muted"]
+
+        style.configure("TButton", padding=(12, 6), font=("Segoe UI", 9),
+                        background=card_bg, foreground=fg, borderwidth=0)
+        style.map("TButton", 
+                  background=[("pressed", theme.get("button_hover", accent)), ("active", theme.get("card_hover", card_bg))],
+                  foreground=[("disabled", muted), ("!disabled", fg)])
+
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabelframe", background=bg, foreground=fg)
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("TEntry", fieldbackground=card_bg, foreground=fg, borderwidth=1, relief="solid")
+
+        self.configure(bg=bg)
+        if hasattr(self, 'card_canvas'):
+            self.card_canvas.configure(bg=bg, highlightthickness=0, borderwidth=0)
+        if hasattr(self, 'card_frame'):
+            self.card_frame.configure(bg=bg)
+
+    def refresh_folder_list(self):
+        self.folder_list.delete(0, tk.END)
+        for folder in self.folders:
+            self.folder_list.insert(tk.END, folder)
+
+    def save_user_config(self):
+        save_config(self.folders, self.excludes, self.filters, self.theme_name, self.app_folders,
+                    self.desktop_order, self.dock_paths, {
+                        "columns": self.desktop_columns,
+                        "rows": self.desktop_rows,
+                        "layout_mode": self.layout_mode,
+                        "icon_shape": self.icon_shape,
+                        "positions": self.desktop_positions,
+                    }, self.hidden_paths, self.badges)
+
+    def change_android_page(self, delta):
+        if self.theme_name != "android":
+            return
+        page_size = self.desktop_columns * self.desktop_rows
+        page_count = max(1, (len(self._android_items) + page_size - 1) // page_size)
+        self.android_page = max(0, min(self.android_page + delta, page_count - 1))
+        self._render_android_page()
+
+    def add_folder(self):
+        folder = filedialog.askdirectory(title="选择扫描目录")
+        if folder and folder not in self.folders:
+            self.folders.append(folder)
+            self.save_user_config()
+            self.refresh_folder_list()
+
+    def remove_folder(self):
+        selected = list(self.folder_list.curselection())
+        for index in reversed(selected):
+            del self.folders[index]
+        self.save_user_config()
+        self.refresh_folder_list()
+
+    def start_scan(self):
+        if not self.folders:
+            self.status.config(text="请先添加至少一个扫描目录")
+            return
+        self.scan_button.config(state=tk.DISABLED)
+        self.progress.configure(mode="indeterminate", value=0)
+        self.progress.start(12)
+        self.status.config(text="正在扫描并进行降噪筛选……")
+        self.apps = []
+        self.render_apps()
+
+        def worker():
+            def progress(done, total):
+                self.after(0, lambda: self.update_scan_progress(done, total))
+
+            results = scan_executables(self.folders, self.excludes, self.filters,
+                                       on_progress=progress)
+            self.after(0, lambda: self.scan_finished(results))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def scan_finished(self, results):
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=1, value=1)
+        self.scan_button.config(state=tk.NORMAL)
+        self.apps = results
+        save_scan_cache(self.folders, self.excludes, self.filters, results)
+        self.status.config(text=f"筛选完成：保留 {len(results)} 个 GUI 应用")
+        self.render_apps()
+
+    def update_scan_progress(self, done, total):
+        if total <= 0:
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=1, value=1)
+            self.status.config(text="未找到 EXE 文件")
+            return
+        if str(self.progress.cget("mode")) == "indeterminate":
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=total, value=0)
+        self.progress.configure(value=done)
+        self.status.config(text=f"正在扫描：{done}/{total} 个 EXE，进行降噪筛选……")
+
+    def render_apps(self):
+        query = self.search.get().strip().lower()
+        sort_key = self.sort_value.get()
+        self.filtered_apps = [app for app in self.apps
+                              if self._matches_search(app, query)
+                              and not self._is_hidden(app.path)]
+        if sort_key == "大小":
+            self.filtered_apps.sort(key=lambda app: app.size, reverse=True)
+        elif sort_key == "修改时间":
+            self.filtered_apps.sort(key=lambda app: app.modified, reverse=True)
+        else:
+            self.filtered_apps.sort(key=lambda app: app.name.lower())
+        if self.theme_name == "android":
+            self._render_android_apps(query)
+            return
+        for child in self.card_frame.winfo_children():
+            child.destroy()
+        self.app_by_iid = {}
+        self.card_widgets = {}
+        self.selected_app_path = None
+        self.current_card_row = None
+        display_index = 0
+        for folder_name in sorted(self.app_folders, key=str.casefold):
+            folder_apps = [app for app in self.filtered_apps
+                           if app.path in self.app_folders[folder_name]]
+            if query and query not in folder_name.casefold() and not folder_apps:
+                continue
+            self._create_folder_card(display_index, folder_name)
+            display_index += 1
+        assigned_paths = {path for paths in self.app_folders.values() for path in paths}
+        for app in self.filtered_apps:
+            if app.path in assigned_paths:
+                continue
+            self._create_app_card(display_index, app)
+            display_index += 1
+        self.card_frame.update_idletasks()
+        self.card_canvas.configure(scrollregion=self.card_canvas.bbox("all"))
+        self.count_label.config(text=f"{len(self.filtered_apps)} / {len(self.apps)} 个应用")
+
+    def _render_android_apps(self, query):
+        folder_items = []
+        for folder_name in sorted(self.app_folders, key=str.casefold):
+            folder_apps = [app for app in self.filtered_apps
+                            if app.path in self.app_folders[folder_name]]
+            if not query or query in folder_name.casefold() or folder_apps:
+                folder_items.append(("folder", folder_name))
+
+        assigned = {path for paths in self.app_folders.values() for path in paths}
+        apps = [app for app in self.filtered_apps if app.path not in assigned]
+        order = {path: index for index, path in enumerate(self.desktop_order)}
+        apps.sort(key=lambda app: (order.get(app.path, len(order)), app.name.casefold()))
+        self._android_items = folder_items + [("app", app) for app in apps]
+        page_size = self.desktop_columns * self.desktop_rows
+        page_count = max(1, (len(self._android_items) + page_size - 1) // page_size)
+        self.android_page = min(self.android_page, page_count - 1)
+        self._render_android_page()
+        self.count_label.config(text=f"{len(self.filtered_apps)} / {len(self.apps)} 个应用")
+
+    def _render_android_page(self):
+        for child in self.card_frame.winfo_children():
+            child.destroy()
+        self.app_by_iid = {}
+        self.card_widgets = {}
+        self.android_app_cards = []
+        self.selected_app_path = None
+        page_size = self.desktop_columns * self.desktop_rows
+        page_items = self._android_items[self.android_page * page_size:
+                                         (self.android_page + 1) * page_size]
+        theme = THEMES["android"]
+        for column in range(self.desktop_columns):
+            self.card_frame.grid_columnconfigure(column, weight=1)
+        for index, (kind, value) in enumerate(page_items):
+            row, column = divmod(index, self.desktop_columns)
+            if kind == "folder":
+                self._create_android_folder(row, column, value, theme)
+            else:
+                self._create_android_app(row, column, value, theme)
+        page_count = max(1, (len(self._android_items) + page_size - 1) // page_size)
+        self.android_page_label.configure(text=f"第 {self.android_page + 1} / {page_count} 页")
+        self.android_prev_button.configure(state=tk.NORMAL if self.android_page else tk.DISABLED)
+        self.android_next_button.configure(state=tk.NORMAL if self.android_page < page_count - 1
+                                            else tk.DISABLED)
+        self._render_android_dock(theme)
+
+    def _create_android_app(self, row, column, app, theme):
+        iid = f"android-app-{row}-{column}"
+        self.app_by_iid[iid] = app
+        icon_size = self._android_icon_size()
+        card = tk.Frame(self.card_frame, bg=theme["card"], width=130, height=180,
+                        highlightthickness=1, highlightbackground="#3a3a3a")
+        card.grid(row=row, column=column, padx=8, pady=8, sticky="nsew")
+        card.grid_propagate(False)
+        if self.layout_mode == "free":
+            x, y = self.desktop_positions.get(app.path, (column * 146, row * 194))
+            card.grid_forget()
+            card.place(x=x, y=y)
+        icon = tk.Label(card, bg=theme["card"], fg=theme["accent"], width=6, height=3,
+                        relief=tk.FLAT)
+        icon.pack(pady=(2, 4))
+        placeholder = self._placeholder_icon(app, icon_size)
+        if ImageTk and placeholder:
+            icon.image = ImageTk.PhotoImage(placeholder)
+            icon.configure(image=icon.image)
+        else:
+            icon.configure(text=(app.name[:1] or "A").upper(), font=("Segoe UI", 22, "bold"))
+        name = tk.Label(card, text=app.name, bg=theme["card"], fg=theme["text"],
+                        font=("Segoe UI", 9), wraplength=120, justify=tk.CENTER)
+        name.pack(fill=tk.X)
+        badge_value = self.badges.get(app.path, "")
+        badge = None
+        if badge_value and badge_value not in ("0", "None"):
+            badge = tk.Label(card, text=badge_value, bg="#e53935", fg="white",
+                             font=("Segoe UI", 8, "bold"), padx=4, pady=1)
+            badge.place(relx=1.0, x=-5, y=5, anchor="ne")
+        self.card_widgets[iid] = card
+        self.android_app_cards.append((card, app.path, iid))
+        for widget in (card, icon, name):
+            widget.bind("<Enter>", lambda _, target=card: self._set_android_card_hover(target, True))
+            widget.bind("<Leave>", lambda _, target=card: self._set_android_card_hover(target, False))
+            widget.bind("<Button-1>", lambda _, key=iid: self.select_card(key))
+            widget.bind("<Double-1>", lambda _, key=iid: self.select_card(key, launch=True))
+            widget.bind("<Button-3>", lambda event, key=iid: self.show_app_menu(event, key))
+            widget.bind("<ButtonPress-1>", lambda event, path=app.path, key=iid:
+                        self._android_press(event, path, key))
+            widget.bind("<B1-Motion>", self._android_motion)
+            widget.bind("<ButtonRelease-1>", self._android_release)
+        self.after(10, lambda: self._load_card_icon(app, icon, icon_size))
+
+    def _android_icon_size(self):
+        available_width = self.card_canvas.winfo_width()
+        if available_width <= 1:
+            available_width = 850
+        return max(44, min(88, (available_width // self.desktop_columns) - 38))
+
+    def _set_android_card_hover(self, card, hovered):
+        if self.android_dragging:
+            return
+        color = "#333333" if hovered else THEMES["android"]["card"]
+        card.configure(bg=color)
+        for child in card.winfo_children():
+            if child.winfo_exists():
+                child.configure(bg=color)
+
+    def _create_android_folder(self, row, column, folder_name, theme):
+        iid = f"android-folder-{folder_name}"
+        card = tk.Frame(self.card_frame, bg=theme["card"], width=130, height=180,
+                        highlightthickness=1, highlightbackground="#3a3a3a")
+        card.grid(row=row, column=column, padx=8, pady=8, sticky="nsew")
+        card.grid_propagate(False)
+        icon = tk.Label(card, text="📁", bg=theme["card"], fg=theme["accent"],
+                        font=("Segoe UI Emoji", 38))
+        icon.pack(pady=(2, 4))
+        name = tk.Label(card, text=folder_name, bg=theme["card"], fg=theme["text"],
+                        font=("Segoe UI", 9), wraplength=120, justify=tk.CENTER)
+        name.pack(fill=tk.X)
+        self.card_widgets[iid] = card
+        for widget in (card, icon, name):
+            widget.bind("<Enter>", lambda _, target=card: self._set_android_card_hover(target, True))
+            widget.bind("<Leave>", lambda _, target=card: self._set_android_card_hover(target, False))
+            widget.bind("<Double-1>", lambda _, value=folder_name: self.open_folder(value))
+            widget.bind("<ButtonRelease-1>", lambda _: self._drop_on_folder(folder_name))
+
+    def _render_android_dock(self, theme):
+        for child in self.dock_frame.winfo_children():
+            child.destroy()
+        available = {app.path: app for app in self.apps}
+        dock_apps = [available[path] for path in self.dock_paths if path in available]
+        if not dock_apps:
+            dock_apps = self.filtered_apps[:5]
+        for app in dock_apps[:5]:
+            button = tk.Button(self.dock_frame, text=app.name[:12], command=lambda path=app.path:
+                               self.launch_path(path), bg=theme["card"], fg=theme["text"],
+                               activebackground="#005a9e", activeforeground="white",
+                               relief=tk.FLAT, padx=10)
+            button.bind("<Enter>", lambda event, item=button: item.configure(bg="#333333"))
+            button.bind("<Leave>", lambda event, item=button: item.configure(bg=theme["card"]))
+            button.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=5, pady=5)
+
+    def _android_press(self, event, path, iid):
+        if self.android_press_after is not None:
+            self.after_cancel(self.android_press_after)
+        self.select_card(iid)
+        self.drag_app_path = path
+        self.android_drag_path = path
+        self.android_drag_iid = iid
+        self.android_dragging = False
+        self.android_drag_target = None
+        card = self.card_widgets.get(iid)
+        if card is not None:
+            self.android_drag_offset = (event.x_root - card.winfo_rootx(),
+                                        event.y_root - card.winfo_rooty())
+        self.android_press_after = self.after(
+            800, lambda: self._start_android_drag(path, iid))
+
+    def _start_android_drag(self, path, iid):
+        self.android_press_after = None
+        if self.android_drag_path != path:
+            return
+        self.android_dragging = True
+        card = self.card_widgets.get(iid)
+        if card is not None:
+            card_x, card_y = card.winfo_x(), card.winfo_y()
+            card.grid_forget()
+            card.place(x=card_x, y=card_y)
+            card.configure(highlightbackground=THEMES["android"]["accent"],
+                           highlightthickness=2, cursor="hand2")
+
+    def _android_motion(self, event):
+        if not self.android_dragging:
+            return
+        card = self.card_widgets.get(self.android_drag_iid)
+        if card is not None:
+            root_x, root_y = self.card_frame.winfo_rootx(), self.card_frame.winfo_rooty()
+            x = max(0, event.x_root - root_x - self.android_drag_offset[0])
+            y = max(0, event.y_root - root_y - self.android_drag_offset[1])
+            card.place(x=x, y=y)
+        target = self._android_target_path(event)
+        if target == self.android_drag_path:
+            target = None
+        if target == self.android_drag_target:
+            return
+        self._clear_android_drag_target()
+        self.android_drag_target = target
+        if target:
+            for card, path, _ in self.android_app_cards:
+                if path == target:
+                    card.configure(highlightbackground=THEMES["android"]["accent"],
+                                   highlightthickness=3)
+                    break
+
+    def _android_release(self, event):
+        if self.android_press_after is not None:
+            self.after_cancel(self.android_press_after)
+            self.android_press_after = None
+        if self.android_dragging:
+            target = self._android_target_path(event)
+            source = self.android_drag_path
+            source_iid = self.android_drag_iid
+            self._reset_android_drag()
+            if target and target != source:
+                self._create_android_folder_from_apps(source, target)
+            elif source and self.layout_mode == "free":
+                card = self.card_widgets.get(source_iid)
+                if card is not None:
+                    self.desktop_positions[source] = (card.winfo_x(), card.winfo_y())
+                    self.save_user_config()
+            elif source:
+                self.render_apps()
+        else:
+            self._reset_android_drag()
+
+    def _android_target_path(self, event):
+        for card, path, _ in self.android_app_cards:
+            left, top = card.winfo_rootx(), card.winfo_rooty()
+            right = left + card.winfo_width()
+            bottom = top + card.winfo_height()
+            if left <= event.x_root <= right and top <= event.y_root <= bottom:
+                return path
+        return None
+
+    def _clear_android_drag_target(self):
+        for card, path, _ in self.android_app_cards:
+            card.configure(highlightbackground="#3a3a3a", highlightthickness=1)
+
+    def _reset_android_drag(self):
+        self._clear_android_drag_target()
+        self.android_dragging = False
+        self.android_drag_path = None
+        self.android_drag_iid = None
+        self.android_drag_target = None
+        self.drag_app_path = None
+
+    def _create_android_folder_from_apps(self, source, target):
+        folder_name = "新建文件夹"
+        suffix = 2
+        while folder_name in self.app_folders:
+            folder_name = f"新建文件夹 {suffix}"
+            suffix += 1
+        self.remove_from_folders(source, refresh=False)
+        self.remove_from_folders(target, refresh=False)
+        self.app_folders[folder_name] = {source, target}
+        self.save_user_config()
+        self.render_apps()
+
+    def _drop_on_folder(self, folder_name):
+        if self.drag_app_path:
+            path = self.drag_app_path
+            self._reset_android_drag()
+            self.move_to_folder(folder_name, path)
+
+    def _create_app_card(self, index, app):
+        theme = THEMES[self.theme_name]
+        iid = f"app-{index}"
+        self.app_by_iid[iid] = app
+        if index % 5 == 0:
+            self.current_card_row = tk.Frame(self.card_frame, bg=theme["background"])
+            self.current_card_row.pack(fill=tk.X, anchor=tk.W)
+
+        card_width = 130
+        card_height = 180
+        icon_size = 80
+
+        card = tk.Frame(self.current_card_row, bg=theme["background"], width=card_width, height=card_height)
+        card.pack(side=tk.LEFT, padx=8, pady=8, anchor=tk.N)
+        card.pack_propagate(False)
+        self.card_widgets[iid] = card
+
+        inner_card = tk.Frame(card, bg=theme["card"], highlightthickness=1,
+                             highlightbackground=theme.get("border", "#3a3a3a"),
+                             padx=8, pady=8, width=card_width, height=card_height)
+        inner_card.pack(fill=tk.BOTH, expand=True)
+        inner_card.pack_propagate(False)
+
+        icon_label = tk.Label(inner_card, bg=theme["card"])
+        icon_label.pack(pady=(0, 8))
+        placeholder = self._placeholder_icon(app, icon_size)
+        if ImageTk and placeholder:
+            icon_label.image = ImageTk.PhotoImage(placeholder)
+            icon_label.configure(image=icon_label.image)
+        else:
+            icon_label.configure(text="APP", font=("Segoe UI", 24, "bold"), fg=theme["accent"])
+
+        name_label = tk.Label(inner_card, text=app.name, bg=theme["card"], fg=theme["text"],
+                              font=("Segoe UI", 9, ""), wraplength=120, justify=tk.CENTER)
+        name_label.pack(fill=tk.X)
+
+        def on_enter(e):
+            inner_card.config(bg=theme.get("card_hover", theme["card"]))
+            name_label.config(bg=theme.get("card_hover", theme["card"]))
+            icon_label.config(bg=theme.get("card_hover", theme["card"]))
+
+        def on_leave(e):
+            inner_card.config(bg=theme["card"])
+            name_label.config(bg=theme["card"])
+            icon_label.config(bg=theme["card"])
+
+        for widget in (card, inner_card, icon_label, name_label):
+            widget.bind("<Button-1>", lambda _, key=iid: self.select_card(key))
+            widget.bind("<Double-1>", lambda _, key=iid: self.select_card(key, launch=True))
+            widget.bind("<Button-3>", lambda event, key=iid: self.show_app_menu(event, key))
+            widget.bind("<Enter>", on_enter)
+            widget.bind("<Leave>", on_leave)
+
+        self.after(10, lambda: self._load_card_icon(app, icon_label, icon_size))
+
+    def _create_folder_card(self, index, folder_name):
+        theme = THEMES[self.theme_name]
+        iid = f"folder-{folder_name}"
+        if index % 5 == 0:
+            self.current_card_row = tk.Frame(self.card_frame, bg=theme["background"])
+            self.current_card_row.pack(fill=tk.X, anchor=tk.W)
+
+        card_width = 130
+        card_height = 180
+
+        card = tk.Frame(self.current_card_row, bg=theme["background"], width=card_width, height=card_height)
+        card.pack(side=tk.LEFT, padx=8, pady=8, anchor=tk.N)
+        card.pack_propagate(False)
+
+        inner_card = tk.Frame(card, bg=theme["card"], highlightthickness=1,
+                             highlightbackground=theme.get("border", "#3a3a3a"),
+                             padx=8, pady=8, width=card_width, height=card_height)
+        inner_card.pack(fill=tk.BOTH, expand=True)
+        inner_card.pack_propagate(False)
+
+        icon_label = tk.Label(inner_card, text="📁", bg=theme["card"], fg=theme["accent"],
+                              font=("Segoe UI Emoji", 48))
+        icon_label.pack(expand=True)
+
+        name_label = tk.Label(inner_card, text=folder_name, bg=theme["card"], fg=theme["text"],
+                              font=("Segoe UI", 9), wraplength=114, justify=tk.CENTER)
+        name_label.pack(fill=tk.X)
+
+        def on_enter(e):
+            inner_card.config(bg=theme.get("card_hover", theme["card"]))
+            name_label.config(bg=theme.get("card_hover", theme["card"]))
+            icon_label.config(bg=theme.get("card_hover", theme["card"]))
+
+        def on_leave(e):
+            inner_card.config(bg=theme["card"])
+            name_label.config(bg=theme["card"])
+            icon_label.config(bg=theme["card"])
+
+        for widget in (card, inner_card, icon_label, name_label):
+            widget.bind("<Double-1>", lambda _, name=folder_name: self.open_folder(name))
+            widget.bind("<Enter>", on_enter)
+            widget.bind("<Leave>", on_leave)
+
+        self.card_widgets[iid] = card
+
+    def show_app_menu(self, event, iid):
+        app = self.app_by_iid.get(iid)
+        if app is None:
+            return
+        menu = tk.Menu(self, tearoff=False)
+        if self.app_folders:
+            for folder_name in sorted(self.app_folders, key=str.casefold):
+                menu.add_command(label=f"移动到：{folder_name}",
+                                 command=lambda name=folder_name, path=app.path: self.move_to_folder(name, path))
+            menu.add_separator()
+        if self.theme_name == "android":
+            if app.path in self.dock_paths:
+                menu.add_command(label="从 Dock 移除",
+                                 command=lambda path=app.path: self.remove_from_dock(path))
+            else:
+                menu.add_command(label="固定到 Dock",
+                                 command=lambda path=app.path: self.pin_to_dock(path))
+            menu.add_separator()
+        menu.add_command(label="从所有文件夹移除", command=lambda path=app.path: self.remove_from_folders(path))
+        menu.add_command(label="启动应用", command=lambda path=app.path: self.launch_path(path))
+        menu.add_command(label="以管理员身份运行",
+                         command=lambda path=app.path: self.launch_path(path, as_admin=True))
+        menu.add_command(label="隐藏图标", command=lambda path=app.path: self.hide_app(path))
+        menu.add_command(label="卸载/打开应用管理", command=self.open_uninstall_settings)
+        menu.add_command(label="打开所在位置", command=lambda path=app.path: self.open_path_location(path))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def move_to_folder(self, folder_name, path):
+        self.remove_from_folders(path, refresh=False)
+        self.app_folders.setdefault(folder_name, set()).add(path)
+        self.save_user_config()
+        self.render_apps()
+
+    def hide_app(self, path):
+        self.hidden_paths.add(path)
+        self.save_user_config()
+        self.render_apps()
+
+    @staticmethod
+    def open_uninstall_settings():
+        try:
+            os.startfile("ms-settings:appsfeatures")
+        except (OSError, AttributeError):
+            subprocess.Popen(["control.exe", "/name", "Microsoft.ProgramsAndFeatures"])
+
+    def pin_to_dock(self, path):
+        if path not in self.dock_paths:
+            self.dock_paths.append(path)
+            self.dock_paths = self.dock_paths[-5:]
+            self.save_user_config()
+            self._render_android_dock(THEMES["android"])
+
+    def remove_from_dock(self, path):
+        if path in self.dock_paths:
+            self.dock_paths.remove(path)
+            self.save_user_config()
+            self._render_android_dock(THEMES["android"])
+
+    def remove_from_folders(self, path, refresh=True):
+        for paths in self.app_folders.values():
+            paths.discard(path)
+        if refresh:
+            self.save_user_config()
+            self.render_apps()
+
+    def open_folder(self, folder_name):
+        dialog = tk.Toplevel(self)
+        dialog.title(folder_name)
+        dialog.geometry("620x500")
+        dialog.transient(self)
+        title_row = ttk.Frame(dialog)
+        title_row.pack(fill=tk.X, padx=12, pady=10)
+        name_var = tk.StringVar(value=folder_name)
+        ttk.Entry(title_row, textvariable=name_var, width=25).pack(side=tk.LEFT)
+        search_var = tk.StringVar()
+        ttk.Entry(title_row, textvariable=search_var, width=25).pack(side=tk.RIGHT)
+        ttk.Label(title_row, text="搜索：").pack(side=tk.RIGHT, padx=4)
+
+        canvas = tk.Canvas(dialog, highlightthickness=0, bg=THEMES["android"]["background"])
+        scrollbar = ttk.Scrollbar(dialog, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0), pady=(0, 12))
+        content = tk.Frame(canvas, bg=THEMES["android"]["background"])
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        content.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def render_folder(*_):
+            for child in content.winfo_children():
+                child.destroy()
+            query = search_var.get().strip().casefold()
+            apps = [app for app in self.apps
+                    if app.path in self.app_folders.get(folder_name, set())
+                    and (not query or query in app.name.casefold() or query in app.path.casefold())]
+            for index, app in enumerate(apps):
+                row, column = divmod(index, 4)
+                card = tk.Frame(content, bg=THEMES["android"]["card"], width=130, height=145,
+                                highlightthickness=1, highlightbackground="#dfe3e8")
+                card.grid(row=row, column=column, padx=8, pady=8)
+                card.grid_propagate(False)
+                icon = tk.Label(card, bg=THEMES["android"]["card"])
+                icon.pack(pady=(8, 4))
+                placeholder = self._placeholder_icon(app, 58)
+                if ImageTk and placeholder:
+                    icon.image = ImageTk.PhotoImage(placeholder)
+                    icon.configure(image=icon.image)
+                else:
+                    icon.configure(text="APP", fg=THEMES["android"]["accent"])
+                label = tk.Label(card, text=app.name, bg=THEMES["android"]["card"],
+                                 fg=THEMES["android"]["text"], wraplength=115)
+                label.pack(fill=tk.X)
+                for widget in (card, icon, label):
+                    widget.bind("<Double-1>", lambda _, path=app.path: self.launch_path(path))
+                    widget.bind("<Button-3>", lambda event, path=app.path:
+                                self.remove_from_folder_from_dialog(folder_name, path, dialog))
+                self.after(10, lambda app=app, icon=icon: self._load_card_icon(app, icon, 58))
+            content.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        search_var.trace_add("write", render_folder)
+        render_folder()
+
+        def rename_folder():
+            new_name = name_var.get().strip()
+            if not new_name or new_name == folder_name:
+                return
+            if new_name in self.app_folders:
+                messagebox.showerror("文件夹名称", "该文件夹名称已存在", parent=dialog)
+                return
+            self.app_folders[new_name] = self.app_folders.pop(folder_name)
+            self.save_user_config()
+            dialog.title(new_name)
+            self.render_apps()
+
+        ttk.Button(dialog, text="保存名称", command=rename_folder).pack(pady=(0, 10))
+
+    def remove_from_folder_from_dialog(self, folder_name, path, dialog):
+        self.app_folders.get(folder_name, set()).discard(path)
+        self.save_user_config()
+        dialog.destroy()
+        self.render_apps()
+
+    def _placeholder_icon(self, app, size):
+        if Image is None:
+            return None
+        theme = THEMES[self.theme_name]
+        image = Image.new("RGBA", (size, size), theme["accent"])
+        if ImageDraw:
+            draw = ImageDraw.Draw(image)
+            letter = (app.name.strip() or "A")[0].upper()
+            draw.text((size // 2, size // 2), letter, fill="white", anchor="mm")
+        return self._shape_icon_image(image)
+
+    def _shape_icon_image(self, image):
+        if Image is None or self.icon_shape == "square":
+            return image
+        mask = Image.new("L", image.size, 0)
+        draw = ImageDraw.Draw(mask)
+        bounds = (0, 0, image.width - 1, image.height - 1)
+        if self.icon_shape == "circle":
+            draw.ellipse(bounds, fill=255)
+        else:
+            draw.rounded_rectangle(bounds, radius=max(8, image.width // 5), fill=255)
+        image = image.copy()
+        image.putalpha(mask)
+        return image
+
+    def _load_card_icon(self, app, icon_label, size=96):
+        if not icon_label.winfo_exists():
+            return
+        image = get_icon_image(app, size)
+        if image is None:
+            return
+        if ImageTk:
+            icon_label.image = ImageTk.PhotoImage(self._shape_icon_image(image))
+            icon_label.configure(image=icon_label.image)
+
+    def select_card(self, iid, launch=False):
+        app = self.app_by_iid.get(iid)
+        if app is None:
+            return
+        self.selected_app_path = app.path
+        for card_iid, card in self.card_widgets.items():
+            selected = card_iid == iid
+            card.configure(highlightbackground=THEMES[self.theme_name]["accent"] if selected else "#3a3a3a",
+                           highlightthickness=2 if selected else 1)
+        if launch:
+            self.launch_selected()
+
+    def _resize_card_frame(self, event):
+        self.card_canvas.itemconfigure(self.card_window, width=max(event.width, 850))
+        if (self.theme_name == "android" and hasattr(self, "_android_items")
+                and abs(event.width - self.android_last_width) > 20):
+            self.android_last_width = event.width
+            self.after_idle(self._render_android_page)
+
+    def toggle_theme(self):
+        theme_order = tuple(sorted(THEMES.keys()))
+        self.theme_name = theme_order[(theme_order.index(self.theme_name) + 1) % len(theme_order)]
+        self.config_data["theme"] = self.theme_name
+        self.save_user_config()
+        self.apply_theme()
+        self.render_apps()
+
+    def apply_theme(self):
+        theme = THEMES[self.theme_name]
+        self.configure(bg=theme["background"])
+        if hasattr(self, 'card_canvas'):
+            self.card_canvas.configure(bg=theme["background"])
+        if hasattr(self, 'card_frame'):
+            self.card_frame.configure(bg=theme["background"])
+        if hasattr(self, 'dock_frame'):
+            self.dock_frame.configure(bg=theme["background"])
+        if hasattr(self, 'folder_list'):
+            style_listbox(self.folder_list, theme)
+        if hasattr(self, 'theme_label'):
+            self.theme_label.configure(text=f"当前：{theme['name']}")
+
+        if self.theme_name == "android":
+            if str(self.scan_panel) in self.main_pane.panes():
+                self.main_pane.forget(self.scan_panel)
+            if hasattr(self, 'android_page_label'):
+                self.android_page_label.pack(side=tk.LEFT)
+            if hasattr(self, 'android_prev_button'):
+                self.android_prev_button.pack(side=tk.RIGHT)
+            if hasattr(self, 'android_next_button'):
+                self.android_next_button.pack(side=tk.RIGHT, padx=(4, 0))
+            if hasattr(self, 'dock_frame'):
+                self.dock_frame.pack(fill=tk.X, pady=(6, 0))
+        else:
+            if str(self.scan_panel) not in self.main_pane.panes():
+                self.main_pane.insert(0, self.scan_panel, weight=0)
+            if hasattr(self, 'android_page_label'):
+                self.android_page_label.pack_forget()
+            if hasattr(self, 'android_prev_button'):
+                self.android_prev_button.pack_forget()
+            if hasattr(self, 'android_next_button'):
+                self.android_next_button.pack_forget()
+            if hasattr(self, 'dock_frame'):
+                self.dock_frame.pack_forget()
+
+        self.apply_theme_config()
+
+    @staticmethod
+    def _matches_search(app, query):
+        return not query or query in app.name.lower() or query in app.path.lower()
+
+    def _is_hidden(self, path):
+        normalized = os.path.normcase(os.path.abspath(path))
+        return any(normalized == os.path.normcase(os.path.abspath(item))
+                   for item in self.hidden_paths)
+
+    @staticmethod
+    def _app_values(app):
+        return (
+            app.name, app.path, app.size_text,
+            "完整" if app.metadata.has_version_metadata else "缺失",
+            app.metadata.subsystem_text,
+            "可提取" if app.metadata.has_icon else "无",
+            f"{app.metadata.confidence_score}%",
+        )
+
+    def open_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("应用资源库设置")
+        dialog.geometry("720x700")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        theme = THEMES[self.theme_name]
+        dialog.configure(bg=theme["background"])
+
+        directories = list(self.folders)
+        folder_map = {name: set(paths) for name, paths in self.app_folders.items()}
+        directory_list = tk.Listbox(dialog, height=5)
+        for path in directories:
+            directory_list.insert(tk.END, path)
+        ttk.Label(dialog, text="扫描目录").pack(anchor=tk.W, padx=14, pady=(12, 2))
+        directory_list.pack(fill=tk.X, padx=14)
+        style_listbox(directory_list, theme)
+        directory_buttons = ttk.Frame(dialog)
+        directory_buttons.pack(fill=tk.X, padx=14, pady=4)
+
+        def add_directory():
+            path = filedialog.askdirectory(parent=dialog, title="选择扫描目录")
+            if path and path not in directories:
+                directories.append(path)
+                directory_list.insert(tk.END, path)
+
+        def remove_directory():
+            for index in reversed(directory_list.curselection()):
+                del directories[index]
+            directory_list.delete(0, tk.END)
+            for path in directories:
+                directory_list.insert(tk.END, path)
+
+        ttk.Button(directory_buttons, text="添加目录", command=add_directory).pack(side=tk.LEFT)
+        ttk.Button(directory_buttons, text="删除选中", command=remove_directory).pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(dialog, text="应用文件夹（右键应用卡片可移动到文件夹）").pack(anchor=tk.W, padx=14, pady=(8, 2))
+        folder_list = tk.Listbox(dialog, height=5)
+        folder_list.pack(fill=tk.X, padx=14)
+        style_listbox(folder_list, theme)
+
+        def refresh_folders():
+            folder_list.delete(0, tk.END)
+            for name in sorted(folder_map, key=str.casefold):
+                folder_list.insert(tk.END, name)
+
+        refresh_folders()
+        folder_row = ttk.Frame(dialog)
+        folder_row.pack(fill=tk.X, padx=14, pady=4)
+        folder_name = tk.StringVar()
+        ttk.Entry(folder_row, textvariable=folder_name, width=25).pack(side=tk.LEFT)
+
+        def add_app_folder():
+            name = folder_name.get().strip()
+            if name and name not in folder_map:
+                folder_map[name] = set()
+                folder_name.set("")
+                refresh_folders()
+
+        def remove_app_folder():
+            for index in reversed(folder_list.curselection()):
+                name = folder_list.get(index)
+                folder_map.pop(name, None)
+            refresh_folders()
+
+        ttk.Button(folder_row, text="新建文件夹", command=add_app_folder).pack(side=tk.LEFT, padx=6)
+        ttk.Button(folder_row, text="删除文件夹", command=remove_app_folder).pack(side=tk.LEFT)
+
+        filter_row = ttk.Frame(dialog)
+        filter_row.pack(fill=tk.X, padx=14, pady=(8, 2))
+        ttk.Label(filter_row, text="最小 EXE 体积 KB：").pack(side=tk.LEFT)
+        min_size = tk.StringVar(value=str(self.filters["min_size"] // 1024))
+        ttk.Entry(filter_row, textvariable=min_size, width=8).pack(side=tk.LEFT, padx=6)
+        ttk.Label(dialog, text="额外黑名单（每行一个关键词）").pack(anchor=tk.W, padx=14, pady=(4, 2))
+        denylist = tk.Text(dialog, height=4)
+        denylist.pack(fill=tk.X, padx=14)
+        style_text_widget(denylist, theme)
+        denylist.insert("1.0", "\n".join(self.filters["denylist"]))
+
+        theme_row = ttk.Frame(dialog)
+        theme_row.pack(fill=tk.X, padx=14, pady=8)
+        ttk.Label(theme_row, text="界面风格：").pack(side=tk.LEFT)
+        theme_var = tk.StringVar(value=self.theme_name)
+        theme_options = tuple(sorted(THEMES.keys()))
+        ttk.Combobox(theme_row, textvariable=theme_var, state="readonly",
+                     values=theme_options, width=15).pack(side=tk.LEFT, padx=6)
+
+        desktop_row = ttk.Frame(dialog)
+        desktop_row.pack(fill=tk.X, padx=14, pady=(0, 8))
+        ttk.Label(desktop_row, text="桌面网格：").pack(side=tk.LEFT)
+        columns_var = tk.StringVar(value=str(self.desktop_columns))
+        rows_var = tk.StringVar(value=str(self.desktop_rows))
+        ttk.Combobox(desktop_row, textvariable=columns_var, state="readonly",
+                     values=tuple(str(value) for value in range(4, 9)), width=4).pack(side=tk.LEFT, padx=4)
+        ttk.Label(desktop_row, text="列 ×").pack(side=tk.LEFT)
+        ttk.Combobox(desktop_row, textvariable=rows_var, state="readonly",
+                     values=tuple(str(value) for value in range(3, 9)), width=4).pack(side=tk.LEFT, padx=4)
+        ttk.Label(desktop_row, text="行").pack(side=tk.LEFT)
+        ttk.Label(desktop_row, text="布局：").pack(side=tk.LEFT, padx=(18, 0))
+        layout_var = tk.StringVar(value=self.layout_mode)
+        ttk.Combobox(desktop_row, textvariable=layout_var, state="readonly",
+                     values=("grid", "free"), width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(desktop_row, text="图标：").pack(side=tk.LEFT, padx=(12, 0))
+        shape_var = tk.StringVar(value=self.icon_shape)
+        ttk.Combobox(desktop_row, textvariable=shape_var, state="readonly",
+                     values=("square", "rounded", "circle"), width=9).pack(side=tk.LEFT, padx=4)
+
+        def save_settings(scan=False):
+            try:
+                size_kb = max(0, int(min_size.get().strip() or "0"))
+            except ValueError:
+                messagebox.showerror("设置错误", "最小体积必须是整数 KB", parent=dialog)
+                return
+            self.folders = directories
+            self.filters["min_size"] = size_kb * 1024
+            self.filters["denylist"] = [line.strip() for line in denylist.get("1.0", tk.END).splitlines() if line.strip()]
+            self.app_folders = folder_map
+            self.theme_name = theme_var.get() if theme_var.get() in THEMES else "android"
+            self.desktop_columns = self._read_grid_value(columns_var.get(), 4, 8, 5)
+            self.desktop_rows = self._read_grid_value(rows_var.get(), 3, 8, 4)
+            self.layout_mode = layout_var.get() if layout_var.get() in ("grid", "free") else "grid"
+            self.icon_shape = shape_var.get() if shape_var.get() in ("square", "rounded", "circle") else "square"
+            self.save_user_config()
+            self.refresh_folder_list()
+            self.apply_theme()
+            dialog.destroy()
+            self.render_apps()
+            if scan:
+                self.start_scan()
+
+        actions = ttk.Frame(dialog)
+        actions.pack(fill=tk.X, padx=14, pady=10)
+        ttk.Button(actions, text="保存", command=lambda: save_settings(False)).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="保存并扫描", command=lambda: save_settings(True)).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    def open_filter_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("降噪筛选设置")
+        dialog.geometry("560x330")
+        dialog.transient(self)
+        dialog.grab_set()
+        size_row = ttk.Frame(dialog)
+        size_row.pack(fill=tk.X, padx=14, pady=8)
+        ttk.Label(size_row, text="最小 EXE 体积（KB）：").pack(side=tk.LEFT)
+        min_size = tk.StringVar(value=str(max(0, self.filters["min_size"] // 1024)))
+        ttk.Entry(size_row, textvariable=min_size, width=10).pack(side=tk.LEFT, padx=8)
+        ttk.Label(dialog, text="额外黑名单（每行一个文件名片段）：").pack(anchor=tk.W, padx=14, pady=(8, 2))
+        denylist = tk.Text(dialog, height=5, width=64)
+        denylist.pack(fill=tk.X, padx=14)
+        denylist.insert("1.0", "\n".join(self.filters["denylist"]))
+
+        def save_settings():
+            try:
+                size_kb = max(0, int(min_size.get().strip() or "0"))
+            except ValueError:
+                messagebox.showerror("设置错误", "最小体积必须是整数 KB")
+                return
+            self.filters = {
+                "gui_only": True,
+                "require_version": True,
+                "min_size": size_kb * 1024,
+                "allowlist": [],
+                "denylist": [line.strip() for line in denylist.get("1.0", tk.END).splitlines() if line.strip()],
+            }
+            self.save_user_config()
+            dialog.destroy()
+            self.start_scan()
+
+        ttk.Button(dialog, text="保存并重新扫描", command=save_settings).pack(pady=12)
+
+    def selected_app(self):
+        if not self.selected_app_path:
+            messagebox.showinfo("提示", "请先选择一个应用")
+            return None
+        return next((app for app in self.filtered_apps if app.path == self.selected_app_path), None)
+
+    def launch_selected(self):
+        app = self.selected_app()
+        if app:
+            self.launch_path(app.path)
+
+    def launch_path(self, path, as_admin=False):
+        try:
+            if as_admin and os.name == "nt":
+                result = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", path, None, os.path.dirname(path), 1)
+                if result <= 32:
+                    raise OSError(f"管理员启动失败，错误码：{result}")
+                return
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+            subprocess.Popen([path], startupinfo=startupinfo,
+                             creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+                             close_fds=os.name != "nt")
+        except (OSError, AttributeError, subprocess.SubprocessError) as error:
+            messagebox.showerror("启动失败", str(error))
+
+    def open_location(self):
+        app = self.selected_app()
+        if app:
+            self.open_path_location(app.path)
+
+    @staticmethod
+    def open_path_location(path):
+        subprocess.Popen(["explorer", "/select,", path])
+
+
+if __name__ == "__main__":
+    ApplicationManager().mainloop()
