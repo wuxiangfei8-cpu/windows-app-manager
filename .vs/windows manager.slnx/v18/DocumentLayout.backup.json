@@ -1,0 +1,79 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{46679D2C-99D0-4062-8A3D-C03BBBFDEDC2}|windows manager.pyproj|D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\windows_manager.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{46679D2C-99D0-4062-8A3D-C03BBBFDEDC2}|windows manager.pyproj|solutionrelative:windows_manager.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{46679D2C-99D0-4062-8A3D-C03BBBFDEDC2}|windows manager.pyproj|D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\windows_manager.pyw||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{46679D2C-99D0-4062-8A3D-C03BBBFDEDC2}|windows manager.pyproj|solutionrelative:windows_manager.pyw||{8B382828-6202-11D1-8870-0000F87579D2}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{46679D2C-99D0-4062-8A3D-C03BBBFDEDC2}|windows manager.pyproj|D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{46679D2C-99D0-4062-8A3D-C03BBBFDEDC2}|windows manager.pyproj|solutionrelative:\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs||{8B382828-6202-11D1-8870-0000F87579D2}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 4,
+          "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{40ea2e6b-2121-4bb8-a43e-c83c04b51041}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{3ae79031-e1bc-11d0-8f78-00a0c9110057}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 2,
+              "Title": "\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs",
+              "DocumentMoniker": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs",
+              "RelativeDocumentMoniker": "\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs",
+              "ToolTip": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs",
+              "RelativeToolTip": "\u542F\u52A8 Windows \u5E94\u7528\u8D44\u6E90\u5E93.vbs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAEaSURBVDhPrZQLEoMgDESh04NxM/FmejKbFxIbhX6mdWdSYpBl87G51rqli1CnKd3VqTVr5IR3l8Uzy7K093JuhCNAxo2KLG9u28a6H06JtRNys/UyDBWqupZSU0Pq86yplVIsVPU9cQ8qO8JAllJI2ckgAk58xssauir3o7KAL2tIA1CJQkx8UWibSuLW4fKmdITUr5IqKlkxUhaFppJG\u002BOj0oAnmHqBxSDFgK83BiPAMYmyYsl\u002BCUlXLYVdaSsaC2iPOCv05qGCM3Jffpjqq/KjwH\u002BxzuKfJuIiCIp\u002Bv\u002BG3PRkeVravGbC670YmEuglx4dCzq3IstxJIPHwhwzlUAnMjvD4j6xBrqH\u002Bw4da/AM/lTaEOwzR\u002BQ0oPbRHUw9GAnNwAAAAASUVORK5CYII=",
+              "WhenOpened": "2026-09-10T10:46:43.146Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "windows_manager.pyw",
+              "DocumentMoniker": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\windows_manager.pyw",
+              "RelativeDocumentMoniker": "windows_manager.pyw",
+              "ToolTip": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\windows_manager.pyw",
+              "RelativeToolTip": "windows_manager.pyw",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAUAAAAAAAAAAAAAAA==",
+              "Icon": "00000000-0000-0000-0000-000000000000.000000|iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAMuSURBVDhPrVTPTxNREP627e7SQm0F2mKLUEVICP5IMBqUhB6NJ4/GGGPwoIf\u002BCR7VxBBPhnAxAeVC4kEuJB6Qi0Y8oCGKpoKQUpEWAhX6c7vb3X1Ol5UauzEc/JLJm31v3pdv5u0M/isYY5zpGohEIs8GBgZu8Dxv7tQik8mwbDb7YGpq6lEqlcqa2/twmOs\u002BBgcHEQgEzK9azMzMsHg8fsdut7Pp6enHKysrafPIQA1hBRRkelUQAcLhMEi9jTLxdnZ23pZl2elwOIYWFxe3zTBrwmAwaHpVcFy1OoIg8P39/c1Efo3KJquq\u002BpBEFCpnNiPiL9CFGvtd14rSyclJDA8P22dnZ1tcLlevKIp\u002B45BgqXBpacn0qqDUQGniXN9F9J6/AIeNg1TIyaOjo9/NEAOWhN3d3aZXRV5W8Sq2jY2sBElSwFNuR9x2x5HWtkabrZrogRXKDUEsb\u002BSxmSlg7tsG1LICX4PAX\u002Blpbff7/Q1mmHUNK6/5t2WKKt4uphBbS0NXy2QasvkiV1RtTrfb7TKvWhNWoGkaNHD4ulXGxNwmPibSOH3Ui95wI5rqeahESq8Ln7dwavLpjXe69HlB1/U2y5RXV1eNdb3E48VCDuvpHF1WoJWJhEyjdHWNVNKvJHBbgDQPlOZ74Ls7ZKmwq6vLsCKrw\u002BZu3lCjl1UquA6P0wGPi4eX7EzYhdNB6j5NoiL/AJS1S5YKY7GYsa6tS5BlUkOptTU6EI1IcNp3aQboNAh0eIUdhJybgFrcI9V2Pf9U2B4KQKCIisLbEQFnWz6gx7eMk/4VnGyOobU\u002BDk79SQF5IqNG4YM7loSKohjWfljE8WYn3KIdvkM6OKYBukIEMq2kkj7BiIJRF9Wd0iCEnlimnEwmjVUkuxU5jgzdD3jooUpEppWosT1kTlJE/S127UA89gV1J76Nj48PWRJ2dHSY3h4qg0HUkwz5AmcQajRc6vtIGRHam9aev1y/9/r1xNuRkZFiDeHY2Nj\u002BIPgTN69fThwVQ2Eon4iQHiD3HqzhPNOcvek3b\u002B7HK2Rm6MFAY\u002BoQ08uPWCmRYvl5ncnJBO29JLsajUbDe1HAL6CnYE1YMsFsAAAAAElFTkSuQmCC",
+              "WhenOpened": "2026-09-10T10:46:38.725Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "windows_manager.py",
+              "DocumentMoniker": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\windows_manager.py",
+              "RelativeDocumentMoniker": "windows_manager.py",
+              "ToolTip": "D:\\\u5DE5\u5177\\\u81EA\u5236\u5C0F\u5DE5\u5177\\windows manager\\windows_manager.py*",
+              "RelativeToolTip": "windows_manager.py*",
+              "ViewState": "AgIAAHIGAAAAAAAAAAAAAPcCAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-09-10T09:50:52.106Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
